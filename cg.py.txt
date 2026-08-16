@@ -1,0 +1,342 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import re
+import json
+import sys
+import requests
+import urllib.parse
+from pyquery import PyQuery as pq
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+
+sys.path.append('..')
+from base.spider import Spider
+
+
+class Spider(Spider):
+
+    def init(self, extend=""):
+        self.host = "https://51cg1.com"
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 12; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Connection": "keep-alive",
+            "Referer": self.host + "/"
+        }
+        self.aes_key = b"f5d965df75336270"
+        self.aes_iv = b"97b60394abc2fbe1"
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        self.session.verify = False
+        self.categories = [
+            {"type_id": "wpcz", "type_name": "今日吃瓜"},
+            {"type_id": "sjb", "type_name": "世界杯专栏"},
+            {"type_id": "xsxy", "type_name": "学生校园"},
+            {"type_id": "whhl", "type_name": "网红黑料"},
+            {"type_id": "rdsj", "type_name": "热门大瓜"},
+            {"type_id": "mrdg", "type_name": "吃瓜榜单"},
+            {"type_id": "bkdg", "type_name": "必看大瓜"},
+            {"type_id": "ysyl", "type_name": "看片娱乐"},
+            {"type_id": "mrds", "type_name": "每日大赛"},
+            {"type_id": "lldd", "type_name": "伦理道德"},
+            {"type_id": "gcjq", "type_name": "国产剧情"},
+            {"type_id": "thjx", "type_name": "探花精选"},
+            {"type_id": "whhj", "type_name": "网黄合集"},
+            {"type_id": "cbdj", "type_name": "免费短剧"},
+            {"type_id": "snsn", "type_name": "骚男骚女"},
+            {"type_id": "whmx", "type_name": "明星黑料"},
+            {"type_id": "hwcg", "type_name": "海外吃瓜"},
+            {"type_id": "rrcg", "type_name": "人人吃瓜"},
+            {"type_id": "ldcg", "type_name": "领导干部"},
+            {"type_id": "qubk", "type_name": "吃瓜看戏"},
+            {"type_id": "dcbq", "type_name": "擦边聊骚"},
+            {"type_id": "zzs", "type_name": "51涨知识"},
+            {"type_id": "cgxw", "type_name": "吃瓜新闻"},
+            {"type_id": "51by", "type_name": "51品茶"},
+            {"type_id": "yczq", "type_name": "原创博主"}
+        ]
+        self._re_h1_titled = re.compile(r'<h1[^>]*class="post-title"[^>]*>(.*?)</h1>', re.DOTALL)
+        self._re_h1_any = re.compile(r'<h1[^>]*>(.*?)</h1>', re.DOTALL)
+        self._re_tag = re.compile(r'<[^>]+>')
+        self._re_config = re.compile(r"""data-config=['"](\{.*?\})['"]""", re.DOTALL)
+        self._re_heading = re.compile(r'<h[23][^>]*>(.*?)</h[23]>', re.DOTALL)
+        self._re_pic = re.compile(r"loadBannerDirect\(\s*'([^']+)'")
+        self._re_archives_link = re.compile(r'<a[^>]*href="([^"]*?/archives/[^"]+)"[^>]*>(.*?)</a>', re.DOTALL)
+        self._re_skip_prefix = re.compile(r'^(👉\s*点我跳转[：:]?\s*|👉\s*|点击查看详情\s*→?\s*)')
+        self._re_skip_suffix1 = re.compile(r'\s*[｜|]\s*点击查看详情\s*→?\s*$')
+        self._re_skip_suffix2 = re.compile(r'\s*点击查看详情\s*→?\s*$')
+        self._skip_kw = ("上一篇", "下一篇", "相关文章", "相关推荐", "推荐阅读")
+        self.log("51吃瓜 初始化完成")
+
+    def getName(self):
+        return "51吃瓜"
+
+    def isVideoFormat(self, url):
+        pass
+
+    def manualVideoCheck(self):
+        return False
+
+    def destroy(self):
+        pass
+
+    def _get(self, url):
+        try:
+            r = self.session.get(url, timeout=15)
+            r.encoding = 'utf-8'
+            if r.status_code == 200 and r.text and len(r.text) > 100:
+                return r.text
+        except Exception as e:
+            self.log(f"_get 请求失败: {url} -> {e}")
+        return None
+
+    def _fix(self, u):
+        if not u:
+            return ""
+        if u.startswith("//"):
+            return "https:" + u
+        if u.startswith("/"):
+            return self.host + u
+        return u
+
+    def getpq(self, data):
+        try:
+            return pq(data)
+        except Exception:
+            try:
+                return pq(data.encode('utf-8'))
+            except Exception:
+                return pq('')
+
+    def _extract_pic_url(self, raw_text):
+        if not raw_text:
+            return ""
+        m = self._re_pic.search(raw_text)
+        if m:
+            url = m.group(1).strip()
+            if url.startswith("http") and not url.endswith(".gif"):
+                return url
+        return ""
+
+    def _get_pic_proxy(self, raw_text):
+        pic_url = self._extract_pic_url(raw_text)
+        if pic_url:
+            return f"{self.getProxyUrl()}&url={pic_url}&type=img"
+        return ""
+
+    def _get_img_from_dom(self, item):
+        img = item('img')
+        if img:
+            pic = img.attr('data-src') or ''
+            if not pic or not pic.startswith('http'):
+                pic = img.attr('src') or ''
+            if pic and pic.startswith('http') and not pic.endswith('.gif'):
+                return f"{self.getProxyUrl()}&url={pic}&type=img"
+        script_text = item('script').text()
+        return self._get_pic_proxy(script_text)
+
+    def aesimg(self, data):
+        try:
+            cipher = AES.new(self.aes_key, AES.MODE_CBC, self.aes_iv)
+            return unpad(cipher.decrypt(data), AES.block_size)
+        except Exception:
+            return data
+
+    def localProxy(self, param):
+        ptype = param.get('type', '')
+        if ptype == 'img':
+            try:
+                url = param.get('url', '')
+                if not url or not url.startswith('http'):
+                    return [200, 'image/jpeg', b'']
+                res = requests.get(url, headers=self.headers, timeout=10)
+                if res.status_code == 200 and len(res.content) > 100:
+                    return [200, res.headers.get('Content-Type', 'image/jpeg'), self.aesimg(res.content)]
+            except Exception:
+                pass
+            return [200, 'image/jpeg', b'']
+        return [200, 'text/plain', b'']
+
+    def _parse_list(self, html):
+        if not html:
+            return []
+        doc = self.getpq(html)
+        if not doc:
+            return []
+        results = []
+        seen = set()
+        for item in doc('article').items():
+            try:
+                if item.hasClass('ad-item'):
+                    continue
+                link = item('a[href*="/archives/"]')
+                if not link:
+                    continue
+                href = link.attr('href') or ""
+                if not href or href in seen:
+                    continue
+                seen.add(href)
+                h2 = item('h2.post-card-title')
+                title = h2.text().strip() if h2 else ""
+                if not title or len(title) < 3:
+                    continue
+                pic = self._get_img_from_dom(link)
+                date_text = ""
+                info = item('.post-card-info span')
+                if info:
+                    for s in info.items():
+                        st = s.text()
+                        if "年" in st and "日" in st:
+                            date_text = st.replace("•", "").strip()
+                            break
+                results.append({
+                    "vod_id": self._fix(href),
+                    "vod_name": title,
+                    "vod_pic": pic,
+                    "vod_remarks": date_text
+                })
+            except Exception:
+                continue
+        return results
+
+    def _has_next_page(self, html):
+        return 'class="next"' in html or "class='next'" in html
+
+    def _extract_detail_by_regex(self, html):
+        title = ""
+        m = self._re_h1_titled.search(html)
+        if m:
+            title = self._re_tag.sub('', m.group(1)).strip()
+        if not title:
+            m = self._re_h1_any.search(html)
+            if m:
+                title = self._re_tag.sub('', m.group(1)).strip()
+
+        quality_arr = []
+        for match in self._re_config.finditer(html):
+            config_str = match.group(1)
+            try:
+                cfg = json.loads(config_str)
+                if "video" in cfg and "url" in cfg["video"]:
+                    video_url = cfg["video"]["url"]
+                    if video_url:
+                        before_config = html[:match.start()]
+                        heading_matches = list(self._re_heading.finditer(before_config))
+                        name = ""
+                        if heading_matches:
+                            last_heading = heading_matches[-1].group(1)
+                            name = self._re_tag.sub('', last_heading).strip()
+                        if (not name or len(name) < 2
+                                or any(kw in name for kw in self._skip_kw)
+                                or "{{" in name or "}}" in name):
+                            name = "视频" + str(len(quality_arr) // 2 + 1)
+                        quality_arr.append(name)
+                        quality_arr.append(video_url)
+            except Exception:
+                continue
+
+        vod_play_url = ""
+        if quality_arr:
+            vod_play_url = "接口免费$" + "$".join(quality_arr)
+        else:
+            links = self._re_archives_link.findall(html)
+            play_items = []
+            seen_hrefs = set()
+            for href, txt in links:
+                txt_clean = self._re_tag.sub('', txt).strip()
+                has_jump = "点我查看详情" in txt_clean or "点我跳转" in txt_clean or "点击查看详情" in txt_clean
+                if (has_jump
+                        and not any(kw in txt_clean for kw in self._skip_kw)
+                        and len(txt_clean) > 2):
+                    clean_title = self._re_skip_prefix.sub('', txt_clean).strip()
+                    clean_title = self._re_skip_suffix1.sub('', clean_title).strip()
+                    clean_title = self._re_skip_suffix2.sub('', clean_title).strip()
+                    if clean_title and href not in seen_hrefs:
+                        seen_hrefs.add(href)
+                        clean_href = href.split("#")[0]
+                        play_items.append(clean_title + "$" + self._fix(clean_href))
+            if play_items:
+                vod_play_url = "#".join(play_items)
+
+        return title, vod_play_url
+
+    def homeContent(self, filter):
+        return {"class": self.categories, "list": [], "filters": {}}
+
+    def homeVideoContent(self):
+        html = self._get(self.host + "/")
+        return {"list": self._parse_list(html)}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        page = int(pg) if pg else 1
+        url = self.host + "/category/" + tid + "/"
+        if page > 1:
+            url += str(page) + "/"
+        html = self._get(url)
+        items = self._parse_list(html)
+        pagecount = page
+        if html and self._has_next_page(html):
+            pagecount = page + 1
+        return {"page": page, "pagecount": pagecount, "list": items, "count": len(items)}
+
+    def detailContent(self, ids):
+        result = {"list": []}
+        if not ids:
+            return result
+        vid = ids[0]
+        url = vid if vid.startswith("http") else self._fix(vid)
+        html = self._get(url)
+        if not html:
+            result["list"].append({
+                "vod_id": vid, "vod_name": "", "vod_pic": "", "vod_remarks": "接口免费",
+                "vod_year": "", "vod_area": "", "type_name": "", "vod_director": "",
+                "vod_actor": "", "vod_content": "", "vod_play_from": "吃瓜",
+                "vod_play_url": "页面加载失败$" + url
+            })
+            return result
+        vod_name, vod_play_url = self._extract_detail_by_regex(html)
+        if not vod_play_url:
+            vod_play_url = "未找到视频$" + url
+        result["list"].append({
+            "vod_id": vid, "vod_name": vod_name, "vod_pic": "", "vod_remarks": "接口免费",
+            "vod_year": "", "vod_area": "", "type_name": "", "vod_director": "",
+            "vod_actor": "", "vod_content": "", "vod_play_from": "吃瓜",
+            "vod_play_url": vod_play_url
+        })
+        return result
+
+    def searchContent(self, key, quick, pg="1"):
+        page = int(pg) if pg else 1
+        url = self.host + "/search/" + urllib.parse.quote(key) + "/"
+        if page > 1:
+            url += str(page) + "/"
+        html = self._get(url)
+        items = self._parse_list(html)
+        pagecount = page
+        if html and self._has_next_page(html):
+            pagecount = page + 1
+        return {"list": items, "page": page, "pagecount": pagecount}
+
+    def playerContent(self, flag, id, vipFlags):
+        referer = self.host + "/"
+        if "$" in id:
+            return {"parse": 0, "url": id.split("$"), "header": {"Referer": referer}}
+        if ".m3u8" in id or ".mp4" in id:
+            return {"parse": 0, "url": id, "header": {"Referer": referer}}
+        if "/archives/" in id:
+            url = id if id.startswith("http") else self._fix(id)
+            html = self._get(url)
+            if html:
+                _, vod_play_url = self._extract_detail_by_regex(html)
+                if vod_play_url and "未找到视频" not in vod_play_url and "页面加载失败" not in vod_play_url:
+                    if vod_play_url.startswith("接口免费$"):
+                        rest = vod_play_url[len("接口免费$"):]
+                        if "$" in rest:
+                            return {"parse": 0, "url": rest.split("$"), "header": {"Referer": referer}}
+                        else:
+                            return {"parse": 0, "url": rest, "header": {"Referer": referer}}
+                    elif "#" in vod_play_url:
+                        return {"parse": 1, "url": url, "header": {"Referer": referer}}
+            return {"parse": 1, "url": url, "header": {"Referer": referer}}
+        return {"parse": 1, "url": id, "header": {"Referer": referer}}

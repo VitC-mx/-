@@ -1,0 +1,899 @@
+
+
+import sys
+import json
+import re
+import math
+import time
+import base64
+from urllib.parse import quote, urljoin
+
+import requests
+import zlib
+
+sys.path.append('..')
+from base.spider import Spider
+
+
+class Spider(Spider):
+    HOST = 'https://rou.video'
+    BUILD_CACHE_KEY = 'rou_build_id'
+    CLASS_LIST = [
+        {'type_id': '/v', 'type_name': '推荐'},
+        {'type_id': '/t/國產AV', 'type_name': '国产AV'},
+        {'type_id': '/t/自拍流出', 'type_name': '自拍流出'},
+        {'type_id': '/t/探花', 'type_name': '探花'},
+        {'type_id': '/t/糖心Vlog', 'type_name': '糖心Vlog'},
+        {'type_id': '/t/OnlyFans', 'type_name': 'OnlyFans'},
+        {'type_id': '/t/日本', 'type_name': '日本'},
+        {'type_id': '/t/麻豆傳媒', 'type_name': '麻豆传媒'},
+        {'type_id': '/series', 'type_name': 'AI短剧'},
+    ]
+    PNG_SIG = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    HLS_MIME = 'application/x-mpegURL'
+    M3U8_MIME = 'application/vnd.apple.mpegurl'
+    TS_MIME = 'video/MP2T'
+    PLAY_TTL = 1500
+    playlists = {}
+
+    def getName(self):
+        return '肉视频'
+
+    def init(self, extend):
+        try:
+            self.extendDict = json.loads(extend)
+        except Exception:
+            self.extendDict = {}
+
+    def isVideoFormat(self, url):
+        return True
+
+    def manualVideoCheck(self):
+        return False
+
+    def destroy(self):
+        pass
+
+    def localProxy(self, params):
+        if not isinstance(params, dict):
+            return [404, 'text/plain', '', {}]
+        ptype = params.get('type')
+        if ptype == 'm3u8':
+            return self.proxy_playlist(self.normalize_id(params.get('id')))
+        if ptype == 'ts':
+            return self.proxy_segment(self.normalize_id(params.get('id')), params.get('i'), params.get('range'))
+        if ptype == 'media':
+            return self._proxy_media(params)
+        return [404, 'text/plain', '', {}]
+
+    def _proxy_media(self, params):
+        url = params.get('url')
+        if not isinstance(url, str) or not url:
+            return [404, 'text/plain', 'missing url', {}]
+        vid = params.get('vid') or url.rsplit('/', 1)[-1].split('?')[0]
+        try:
+            head = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+                'Referer': self.HOST + '/v/' + vid,
+                'Origin': self.HOST,
+            }
+            if 'range' in params:
+                head['Range'] = params['range']
+            r = self.fetch(url, headers=head, timeout=30, verify=False)
+            status = getattr(r, 'status_code', 200)
+            body = getattr(r, 'content', None)
+            if body is None:
+                body = getattr(r, 'text', '') or ''
+            is_m3u8 = False
+            if isinstance(body, bytes):
+                is_m3u8 = body.lstrip().startswith(b'#EXT')
+            elif isinstance(body, str):
+                is_m3u8 = body.lstrip().startswith('#EXT')
+            if is_m3u8:
+                text = body.decode('utf-8', 'replace') if isinstance(body, bytes) else body
+                base_dir = url.rsplit('/', 1)[0] + '/'
+                out = []
+                for line in text.split('\n'):
+                    s = line.strip()
+                    if s.startswith('#') or s == '':
+                        out.append(line)
+                    elif s.startswith('http://') or s.startswith('https://'):
+                        out.append(self._proxy_url(s, vid))
+                    elif s.startswith('/'):
+                        out.append(self._proxy_url(self.HOST + s, vid))
+                    else:
+                        out.append(self._proxy_url(base_dir + s, vid))
+                return [200, 'application/vnd.apple.mpegurl', '\n'.join(out)]
+            if isinstance(body, str):
+                body = body.encode('utf-8', 'replace')
+            return [status, 'application/octet-stream', body]
+        except Exception as e:
+            return [404, 'text/plain', 'proxy_err:%s' % e, {}]
+
+    def _proxy_url(self, target, vid=''):
+        u = 'http://127.0.0.1:9978/proxy?do=py&type=media&url=' + quote(target, safe='')
+        if vid:
+            u += '&vid=' + quote(vid, safe='')
+        return u
+
+    
+    
+    
+    
+    
+    
+
+    def normalize_id(self, value):
+        vid = value[0] if isinstance(value, list) and value else value
+        vid = str(vid or '').strip()
+        if vid.startswith(self.HOST):
+            vid = vid[len(self.HOST):]
+        if vid.startswith('/v/'):
+            vid = vid[3:]
+        vid = vid.split('?')[0].split('#')[0].strip('/')
+        allowed = set('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-')
+        return ''.join(ch for ch in vid if ch in allowed)
+
+    def to_int(self, value, default=0):
+        try:
+            return int(float(str(value).strip()))
+        except Exception:
+            return default
+
+    def hls_api_url(self, vid):
+        return self.HOST + '/api/hls/' + vid
+
+    def fetch_index(self, vid, rng=None):
+        head = self._headers()
+        if rng:
+            head['Range'] = rng
+        try:
+            r = self.fetch(self.hls_api_url(vid), headers=head, timeout=25, verify=False)
+        except Exception:
+            return None
+        if r is None:
+            return None
+        if getattr(r, 'status_code', 0) == 404:
+            return None
+        return r
+
+    def fetch_segment(self, url):
+        try:
+            r = self.fetch(url, headers=self._headers(), timeout=30, verify=False)
+        except Exception:
+            return None
+        if r is None:
+            return None
+        return self.unwrap(getattr(r, 'content', None) or b'')
+
+    def unwrap(self, data):
+        if not data or data[:8] != self.PNG_SIG:
+            return data
+        payload = b''
+        pos = 8
+        size = len(data)
+        while pos + 8 <= size:
+            length = int.from_bytes(data[pos:pos + 4], 'big')
+            name = data[pos + 4:pos + 8]
+            if name == b'roUd':
+                payload = data[pos + 8:pos + 8 + length]
+                break
+            if name == b'IEND':
+                break
+            pos += 12 + length
+        if not payload:
+            return data
+        body = payload[1:]
+        if body[:1] == b'G':
+            return body
+        for wbits in (15, -15, 47):
+            try:
+                return zlib.decompress(body, wbits)
+            except Exception:
+                continue
+        return body
+
+    def has_seg(self, entry, idx):
+        return bool(entry) and 0 <= idx < len(entry.get('segs') or [])
+
+    def parse_range(self, value, total):
+        text = str(value or '').strip().lower()
+        if total <= 0 or not text.startswith('bytes='):
+            return None, None
+        span = text[6:].split(',')[0].strip()
+        first, _, last = span.partition('-')
+        if not first:
+            length = self.to_int(last, 0)
+            if length <= 0:
+                return None, None
+            start = max(total - length, 0)
+            end = total - 1
+        else:
+            start = self.to_int(first, -1)
+            end = self.to_int(last, total - 1) if last else total - 1
+        if start < 0 or start >= total:
+            return None, None
+        end = min(end, total - 1)
+        if end < start:
+            return None, None
+        return start, end
+
+    def resolve_playlist(self, vid, refresh=False):
+        now = int(time.time())
+        entry = self.playlists.get(vid)
+        if entry and not refresh and entry.get('expiresAt', 0) > now:
+            return entry
+        r = self.fetch_index(vid)
+        if r is None:
+            return entry
+        final_url = getattr(r, 'url', '') or self.hls_api_url(vid)
+        content = getattr(r, 'content', None) or b''
+        text = self.unwrap(content).decode('utf-8', 'ignore')
+        if '#EXTM3U' not in text:
+            self._log('rou.video playlist parse failed: %s' % vid)
+            return entry
+        segs = []
+        lines = []
+        for line in text.split(chr(10)):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('#'):
+                lines.append(line)
+                continue
+            lines.append(len(segs))
+            segs.append(urljoin(final_url, line))
+        if not segs:
+            return entry
+        entry = {'segs': segs, 'lines': lines, 'expiresAt': now + self.PLAY_TTL}
+        cache = dict(self.playlists)
+        cache[vid] = entry
+        if len(cache) > 3:
+            stale = sorted(cache, key=lambda k: cache[k].get('expiresAt', 0))
+            for key in stale[:len(cache) - 3]:
+                cache.pop(key, None)
+        self.playlists = cache
+        return entry
+
+    def render_playlist(self, vid, entry):
+        prefix = 'http://127.0.0.1:9978/proxy?do=py&type=ts&id=%s&i=' % quote(vid, safe='')
+        out = []
+        for item in entry['lines']:
+            if isinstance(item, int):
+                out.append(prefix + str(item))
+            else:
+                out.append(item)
+        return chr(10).join(out) + chr(10)
+
+    def proxy_playlist(self, vid):
+        entry = self.resolve_playlist(vid)
+        if not entry:
+            entry = self.resolve_playlist(vid, True)
+        if not entry:
+            return [404, 'text/plain', '', {}]
+        return [200, self.M3U8_MIME, self.render_playlist(vid, entry)]
+
+    def proxy_segment(self, vid, index, range_header):
+        idx = self.to_int(index, -1)
+        entry = self.resolve_playlist(vid)
+        if not self.has_seg(entry, idx):
+            entry = self.resolve_playlist(vid, True)
+        if not self.has_seg(entry, idx):
+            return [404, 'text/plain', '', {}]
+        data = self.fetch_segment(entry['segs'][idx])
+        if data is None:
+            entry = self.resolve_playlist(vid, True)
+            if not self.has_seg(entry, idx):
+                return [404, 'text/plain', '', {}]
+            data = self.fetch_segment(entry['segs'][idx])
+        if data is None:
+            return [404, 'text/plain', '', {}]
+        total = len(data)
+        start, end = self.parse_range(range_header, total)
+        if start is None:
+            return [206, self.TS_MIME, data, {'Accept-Ranges': 'bytes'}]
+        return [206, self.TS_MIME, data[start:end + 1],
+                {'Accept-Ranges': 'bytes', 'Content-Range': 'bytes %d-%d/%d' % (start, end, total)}]
+
+    def _log(self, msg):
+        try:
+            self.log(str(msg))
+        except Exception:
+            pass
+
+    def homeContent(self, filter):
+        return {
+            'class': self.CLASS_LIST,
+            'filters': {}
+        }
+
+    def homeVideoContent(self):
+        return {}
+
+    def categoryContent(self, tid, pg, filter, ext):
+        try:
+            page = int(pg)
+        except Exception:
+            page = 1
+        page = max(1, page)
+        if tid.startswith('search:'):
+            return self.searchContent(tid.split('search:', 1)[1], False, pg)
+
+        path = tid
+        if path.startswith('tag:'):
+            path = path.split('tag:', 1)[1]
+        api_path = path
+        params = {'order': 'createdAt', 'page': page}
+
+        try:
+            data = self._next_data(api_path, params)
+            props = self._page_props(data)
+            raw = props.get('videos')
+            if not isinstance(raw, list):
+                raw = props.get('list')
+            if not isinstance(raw, list):
+                raw = self._find_video_list(data)
+            if not isinstance(raw, list):
+                raw = []
+            if path == '/series':
+                videos = self._entry_list(raw, 'series')
+            else:
+                videos = self._entry_list(raw, 'category')
+            pagecount = self._total_page(props, page, len(videos))
+            result = {
+                'list': videos,
+                'page': page,
+                'pagecount': pagecount,
+                'limit': len(videos),
+                'total': len(videos)
+            }
+            if not videos:
+                bid = self._peek_build_id()
+                dk = list((data or {}).keys())[:12] if isinstance(data, dict) else []
+                pk = list((props or {}).keys())[:15] if isinstance(props, dict) else []
+                result['msg'] = 'EMPTY path=%s bid=%s data_keys=%s props_keys=%s' % (path, bid, dk, pk)
+            return result
+        except Exception as exc:
+            return {'list': [], 'page': page, 'pagecount': page, 'limit': 0, 'total': 0, 'msg': '分类获取失败: %s' % exc}
+
+    def detailContent(self, ids):
+        raw = ids[0] if isinstance(ids, list) else ids
+        is_series = False
+        vid = str(raw)
+        if vid.startswith('s:'):
+            is_series = True
+            vid = vid[2:]
+        vid = self.normalize_id(vid)
+        if not vid:
+            return {'list': []}
+        if is_series:
+            return self._detail_series(vid)
+        try:
+            data = self._next_data('/v/' + vid)
+            props = self._page_props(data)
+            video = props.get('video')
+            if not isinstance(video, dict):
+                video = self._find_video_by_id(props, vid) or {}
+            ev = props.get('ev')
+            if not isinstance(ev, dict):
+                ev = self._find_key(props, 'ev')
+            series = props.get('series')
+            name = video.get('nameZh') or video.get('name') or ''
+            if isinstance(series, dict) and (series.get('nameZh') or series.get('name')):
+                name = series.get('nameZh') or series.get('name')
+            pic = video.get('coverImageUrl') or ''
+            vid_code = video.get('vid') or ''
+            duration = video.get('duration')
+            remarks = self._duration_text(duration)
+            tags_original = video.get('tags') if isinstance(video.get('tags'), list) else []
+            tags_zh = video.get('tagsZh') if isinstance(video.get('tagsZh'), list) else []
+            content = self._tags_content(tags_original, tags_zh, vid_code)
+
+            episodes = props.get('episodes')
+            if not isinstance(episodes, list):
+                episodes = []
+            play_items = []
+            if episodes:
+                for index, episode in enumerate(episodes, 1):
+                    if not isinstance(episode, dict):
+                        continue
+                    episode_id = episode.get('id') or episode.get('videoId')
+                    if not episode_id:
+                        continue
+                    episode_ev = episode.get('ev')
+                    if episode_id == vid and isinstance(ev, dict):
+                        episode_ev = ev
+                    play_id = self._encode_play_id(episode_id, episode_ev if isinstance(episode_ev, dict) else None)
+                    play_items.append(('第%d集' % index, play_id))
+            if not play_items:
+                play_id = self._encode_play_id(vid, ev if isinstance(ev, dict) else None)
+                play_items.append(('接口免费', play_id))
+
+            play_url = '#'.join([
+                '%s$%s' % (name.replace('#', '-').replace('$', '*'), play_id)
+                for name, play_id in play_items
+            ])
+            return {'list': [{
+                'vod_id': vid,
+                'vod_name': name,
+                'vod_pic': pic,
+                'type_name': '',
+                'vod_year': '',
+                'vod_area': '',
+                'vod_remarks': '接口免费',
+                'vod_actor': '',
+                'vod_director': '',
+                'vod_content': content,
+                'vod_play_from': 'Rou',
+                'vod_play_url': play_url,
+            }]}
+        except Exception as exc:
+            return {'list': [], 'msg': '详情获取失败: %s' % exc}
+
+    def _detail_series(self, series_id):
+
+        try:
+            data = self._next_data('/s/' + series_id)
+            props = self._page_props(data)
+            series = props.get('series')
+            if not isinstance(series, dict):
+                series = self._find_video_by_id(props, series_id) or {}
+            episodes = props.get('episodes')
+            if not isinstance(episodes, list) or not episodes:
+                first = series.get('firstEpisodeId') or series.get('id')
+                if first:
+                    return self.detailContent([first])
+                return {'list': []}
+            name = series.get('nameZh') or series.get('name') or ''
+            pic = series.get('coverImageUrl') or ''
+            vid_code = series.get('vid') or ''
+            duration = series.get('duration')
+            tags_original = series.get('tags') if isinstance(series.get('tags'), list) else []
+            tags_zh = series.get('tagsZh') if isinstance(series.get('tagsZh'), list) else []
+            content = self._tags_content(tags_original, tags_zh, vid_code)
+            play_items = []
+            for index, episode in enumerate(episodes, 1):
+                if not isinstance(episode, dict):
+                    continue
+                episode_id = episode.get('id') or episode.get('videoId')
+                if not episode_id:
+                    continue
+                episode_ev = episode.get('ev')
+                play_id = self._encode_play_id(episode_id, episode_ev if isinstance(episode_ev, dict) else None)
+                play_items.append(('第%d集' % index, play_id))
+            if not play_items:
+                return {'list': []}
+            play_url = '#'.join([
+                '%s$%s' % (n.replace('#', '-').replace('$', '*'), p)
+                for n, p in play_items
+            ])
+            vod = {
+                'vod_id': 's:' + series_id,
+                'vod_name': self._safe_text(name),
+                'vod_pic': self._safe_text(pic),
+                'vod_remarks': '接口免费',
+                'vod_year': '',
+                'vod_area': '',
+                'type_name': '',
+                'vod_actor': '',
+                'vod_director': '',
+                'vod_content': content,
+                'vod_play_from': 'Rou',
+                'vod_play_url': play_url,
+            }
+            return {'list': [vod]}
+        except Exception as exc:
+            return {'list': [], 'msg': '系列详情获取失败: %s' % exc}
+
+    def playerContent(self, flag, id, vipFlags):
+        video_id, _ev = self._decode_play_id(id)
+        vid = self.normalize_id(video_id)
+        if not vid:
+            return {'parse': 0, 'url': '', 'msg': 'no video id'}
+        
+        try:
+            r = self.fetch_index(vid, 'bytes=0-4095')
+            if r is not None:
+                head = getattr(r, 'content', b'') or b''
+                if head[:7] == b'#EXTM3U':
+                    direct = self.derive_direct(head.decode('utf-8', 'ignore'), getattr(r, 'url', ''))
+                    if direct:
+                        return {'parse': 0, 'url': direct, 'header': self._headers(), 'playUrl': ''}
+        except Exception:
+            pass
+        proxy = 'http://127.0.0.1:9978/proxy?do=py&type=m3u8&id=' + quote(vid, safe='')
+        return {'parse': 0, 'url': proxy, 'header': self._headers(), 'playUrl': ''}
+
+    def _headers(self):
+        return {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+            'Referer': self.HOST + '/',
+            'Origin': self.HOST,
+            'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+        }
+
+    def _request(self, url, params=None, extra_headers=None):
+        headers = self._headers()
+        if extra_headers:
+            headers.update(extra_headers)
+        try:
+            return self.fetch(url, params=params, headers=headers, timeout=20, verify=False)
+        except Exception:
+            return requests.get(url, params=params, headers=headers, timeout=20, allow_redirects=True, verify=False)
+
+    def _get_build_id(self):
+        cached = None
+        try:
+            cached = self.getCache(self.BUILD_CACHE_KEY)
+        except Exception:
+            cached = None
+        if isinstance(cached, dict) and cached.get('buildId'):
+            return cached['buildId']
+        if isinstance(cached, str) and cached:
+            return cached
+
+        response = self._request(self.HOST + '/')
+        data = self._next_data_from_html(response.text)
+        build_id = data.get('buildId')
+        if not build_id:
+            match = re.search(r'"buildId":"([^"]+)"', response.text)
+            if match:
+                build_id = match.group(1)
+        if build_id:
+            try:
+                self.setCache(self.BUILD_CACHE_KEY, {'buildId': build_id})
+            except Exception:
+                pass
+        return build_id
+
+    def _refresh_build_id(self):
+        try:
+            self.delCache(self.BUILD_CACHE_KEY)
+        except Exception:
+            pass
+        return self._get_build_id()
+
+    def _next_data(self, path, params=None):
+        api_path = quote(path, safe='/')
+        query = dict(params or {})
+        for attempt in range(2):
+            build_id = self._get_build_id()
+            if not build_id:
+                break
+            url = self.HOST + '/_next/data/' + build_id + api_path + '.json'
+            try:
+                response = self._request(url, query)
+            except Exception:
+                response = None
+            if response is not None and response.status_code == 200:
+                try:
+                    return json.loads(self.cleanText(response.text))
+                except Exception:
+                    pass
+            if attempt == 0:
+                self._refresh_build_id()
+                continue
+            break
+
+        response = self._request(self.HOST + api_path, query)
+        if response is None or response.status_code != 200:
+            raise RuntimeError('HTTP %s' % response.status_code)
+        data = self._next_data_from_html(self.cleanText(response.text))
+        if not data:
+            raise RuntimeError('NEXT_DATA not found')
+        return data
+
+    def _next_data_from_html(self, html):
+        match = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)</script>', html, re.I)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            return {}
+
+    def _page_props(self, data):
+        if not isinstance(data, dict):
+            return {}
+        page_props = data.get('pageProps')
+        if isinstance(page_props, dict) and page_props:
+            return page_props
+        props = data.get('props')
+        if isinstance(props, dict):
+            inner = props.get('pageProps')
+            if isinstance(inner, dict):
+                return inner
+        return {}
+
+    def _total_page(self, props, page, raw_count):
+        total_page = props.get('totalPage')
+        if isinstance(total_page, (int, float)) and total_page > 0:
+            return max(page, int(total_page))
+        return page if raw_count <= 0 else page + 1
+
+    def _peek_build_id(self):
+        try:
+            cached = self.getCache(self.BUILD_CACHE_KEY)
+        except Exception:
+            cached = None
+        if isinstance(cached, dict):
+            return cached.get('buildId')
+        if isinstance(cached, str):
+            return cached
+        return None
+
+
+    def _find_video_list(self, value):
+        if isinstance(value, dict):
+            for key in ('videos', 'list', 'items', 'data', 'results', 'seriesList', 'series'):
+                v = value.get(key)
+                if isinstance(v, list) and len(v) > 0 and self._looks_like_videos(v):
+                    return v
+            for v in value.values():
+                found = self._find_video_list(v)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = self._find_video_list(item)
+                if found:
+                    return found
+        return None
+
+    def _looks_like_videos(self, lst):
+        sample = lst[:3]
+        if not all(isinstance(x, dict) for x in sample):
+            return False
+        hits = 0
+        for x in sample:
+            if ('id' in x) and ('coverImageUrl' in x or 'name' in x or 'nameZh' in x or 'title' in x):
+                hits += 1
+        return hits >= 1
+
+    def _entry_list(self, entries, mode):
+        result = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            item = self._entry_item(entry, mode)
+            if item:
+                result.append(item)
+        return result
+
+
+    def _entry_item(self, entry, mode):
+        entry_id = entry.get('id') or entry.get('videoId')
+        if not entry_id:
+            return {}
+        
+        is_series_item = bool(entry.get('episodeCount') or entry.get('firstEpisodeId')
+                              or entry.get('seriesId') or entry.get('epLabel'))
+        if mode in ('series', 'search_series') or is_series_item:
+            series_id = entry.get('id') or entry.get('seriesId') or entry.get('firstEpisodeId')
+            if series_id:
+                entry_id = 's:' + str(series_id)
+
+        name = entry.get('nameZh') or entry.get('name') or entry.get('title') or ''
+        pic = entry.get('coverImageUrl') or ''
+        vid_code = entry.get('vid') or ''
+        duration = entry.get('duration')
+
+        if mode in ('search', 'search_series'):
+            if mode == 'search_series':
+                
+                remarks = self._episode_count_text(entry)
+                year = ''
+            else:
+                
+                dur = self._duration_text(duration)
+                code = vid_code if self._is_vid_code(vid_code) else ''
+                remarks = dur + ('|' + code if code else '')
+                year = ''
+        elif mode == 'series':
+            
+            remarks = self._episode_count_text(entry)
+            year = ''
+        else:
+            remarks = self._duration_text(duration)
+            year = vid_code
+
+        return {
+            'vod_id': str(entry_id),
+            'vod_name': self._safe_text(name),
+            'vod_pic': self._safe_text(pic),
+            'vod_remarks': remarks,
+            'vod_year': year,
+            'vod_tag': ''
+        }
+
+    def _find_video_by_id(self, value, video_id):
+        if isinstance(value, dict):
+            if value.get('id') == video_id:
+                return value
+            for child in value.values():
+                found = self._find_video_by_id(child, video_id)
+                if isinstance(found, dict):
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._find_video_by_id(child, video_id)
+                if isinstance(found, dict):
+                    return found
+        return {}
+
+    def _find_key(self, value, key):
+        if isinstance(value, dict):
+            if key in value and isinstance(value[key], dict) and value[key].get('d'):
+                return value[key]
+            for child in value.values():
+                found = self._find_key(child, key)
+                if isinstance(found, dict):
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._find_key(child, key)
+                if isinstance(found, dict):
+                    return found
+        return {}
+
+
+    def _encode_play_id(self, video_id, ev_data):
+        return str(video_id)
+
+    def _decode_play_id(self, play_id):
+        if not isinstance(play_id, str):
+            play_id = str(play_id)
+        if '@@@' in play_id:
+            video_id, encoded = play_id.split('@@@', 1)
+            try:
+                ev_data = json.loads(base64.b64decode(encoded.encode('utf-8')).decode('utf-8'))
+                return video_id, ev_data if isinstance(ev_data, dict) else {}
+            except Exception:
+                return video_id, {}
+        return play_id, {}
+
+    def _duration_text(self, seconds):
+        try:
+            seconds = float(seconds)
+        except Exception:
+            return ''
+        seconds = max(0, int(round(seconds)))
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        if hours > 0:
+            return '%d小时%02d分%02d秒' % (hours, minutes, secs)
+        if minutes > 0:
+            return '%d分%02d秒' % (minutes, secs)
+        return '%d秒' % secs
+
+    def _safe_text(self, value):
+        if value is None:
+            return ''
+        return str(value).strip()
+
+    def _is_vid_code(self, value):
+        
+        
+        s = self._safe_text(value)
+        if not s or len(s) > 24:
+            return False
+        if re.search(r'[一-鿿]', s):
+            return False
+        if not re.search(r'[A-Za-z]', s) or not re.search(r'\d', s):
+            return False
+        return True
+
+    def _tags_content(self, tags_original, tags_zh, vid_code):
+        parts = []
+        for index, original in enumerate(tags_original):
+            original_text = self._safe_text(original)
+            if not original_text:
+                continue
+            if index < len(tags_zh) and self._safe_text(tags_zh[index]):
+                display = self._safe_text(tags_zh[index])
+            else:
+                display = original_text
+            link_tag = original_text
+            if not display or not link_tag:
+                continue
+            path = '/t/' + link_tag
+            parts.append(self._click_item(path, display))
+        if vid_code and self._is_vid_code(vid_code):
+            parts.append(self._click_item('search:' + vid_code, vid_code))
+        if not parts:
+            return ''
+        sep = '，'
+        return '[标签] ' + sep.join(parts)
+
+    def _click_item(self, target, name):
+        payload = json.dumps({'id': target, 'name': name}, ensure_ascii=False, separators=(',', ':'))
+        return '[a=cr:%s/]%s[/a]' % (payload, self._safe_text(name))
+
+    def _series_category_name(self):
+        
+        for item in self.CLASS_LIST:
+            if item.get('type_id') == '/series':
+                name = self._safe_text(item.get('type_name'))
+                if name:
+                    return name
+        return 'AI短剧'
+
+    def searchContent(self, key, quick, pg='1'):
+        if quick:
+            return {'list': []}
+
+        try:
+            page = int(pg)
+        except Exception:
+            page = 1
+        page = max(1, page)
+        keyword = self._safe_text(key).strip()
+
+        
+        
+        
+        series_name = self._series_category_name()
+        is_series = bool(series_name) and keyword.startswith(series_name)
+        if is_series:
+            keyword = keyword[len(series_name):].strip()
+        if not keyword:
+            keyword = 'AI'
+
+        try:
+            if is_series:
+                data = self._next_data('/search', {'q': keyword, 'tab': 'series', 'page': page})
+                props = self._page_props(data)
+                raw = props.get('seriesList')
+                if not isinstance(raw, list):
+                    raw = []
+                results = self._entry_list(raw, 'search_series')
+            else:
+                data = self._next_data('/search', {'q': keyword, 'page': page})
+                props = self._page_props(data)
+                raw = props.get('videos')
+                if not isinstance(raw, list):
+                    raw = []
+                results = self._entry_list(raw, 'search')
+            pagecount = self._total_page(props, page, len(raw))
+            return {'list': results, 'page': page, 'pagecount': pagecount, 'limit': len(results), 'total': len(results)}
+        except Exception as exc:
+            return {'list': [], 'page': page, 'pagecount': page, 'limit': 0, 'total': 0, 'msg': '搜索获取失败: %s' % exc}
+
+    def derive_direct(self, text, final_url):
+        
+        
+        for line in text.split('\n')[:-1]:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            seg = urljoin(final_url, line)
+            path, sep, query = seg.partition('?')
+            if path.count('/') < 4:
+                return ''
+            guess = path.rsplit('/', 1)[0] + '/index.m3u8' + (sep + query)
+            try:
+                r = self.fetch(guess, headers=self._headers(), timeout=15, verify=False)
+                if r is not None and (getattr(r, 'content', b'') or b'')[:7] == b'#EXTM3U':
+                    return guess
+            except Exception:
+                pass
+            return ''
+        return ''
+
+    def _episode_count_text(self, entry):
+        
+        if not isinstance(entry, dict):
+            return ''
+        count = entry.get('episodeCount')
+        if count is None:
+            eps = entry.get('episodes')
+            count = len(eps) if isinstance(eps, list) else 0
+        try:
+            count = int(count)
+        except Exception:
+            count = 0
+        if count > 0:
+            return '%d集' % count
+        return self._duration_text(entry.get('duration'))

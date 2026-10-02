@@ -1,0 +1,1284 @@
+import re
+import json
+import time
+import gzip
+import os
+import hmac
+import hashlib
+import random
+import uuid
+import base64
+import urllib.parse
+
+import requests
+from base.spider import Spider
+
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    AES = None
+
+class Spider(Spider):
+
+    UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36'
+
+    SOURCES = [
+        ('hg', '黄果'),
+        ('yg', '野果'),
+        ('jg', '禁果'),
+        ('wj', '51短剧'),
+        ('hj', '黄剧'),
+		('hd', '黄豆'),
+    ]
+
+    
+    HG_BASE = 'https://huangguoai.com'
+    HG_CATS = [
+        ('ai-duanju', 'AI短剧'), ('ai-manju', 'AI漫剧'),
+        ('ai-huanlian', 'AI换脸'), ('ai-mogai', 'AI魔改'),
+    ]
+    HG_SORTS = [('hot', '最热'), ('new', '最新')]
+
+    
+    YG_API = 'https://www.yeguodj.com/api.php'
+    YG_SITE = 'https://www.yeguodj.com'
+    WJ_API = 'https://api.51dj1.com/api.php'
+    WJ_SITE = 'https://51hub.com'
+    PHP_KEY = b'2acf7e91e9864673'
+    PHP_IV = b'1c29882d3ddfcfd6'
+    
+    MEDIA_KEY = b'f5d965df75336270'
+    MEDIA_IV = b'97b60394abc2fbe1'
+    YG_BG = [('40', '都市'), ('39', '现代'), ('47', '校园'), ('41', '古代'),
+             ('42', '乡村'), ('44', '职场')]
+    YG_SET = [('26', '重生'), ('27', '穿越'), ('28', '系统'), ('53', '逆袭'), ('56', '魔改')]
+    
+    WJ_BG = [('40', '都市'), ('41', '古代'), ('42', '乡村')]
+    WJ_SET = [('27', '穿越'), ('28', '系统')]
+
+    
+    JG_API = 'https://www.jgdj.app'
+    JG_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+    JG_CATS = [
+        ('latest', '最新'), ('heat', '最热'), ('nav_2', '全部短剧'),
+        ('nav_7', '原创精品'), ('nav_3', '单体作品'),
+        ('nav_6', '动漫改编'), ('nav_5', '影视改编'),
+    ]
+
+    
+    HD_BASE = 'https://tideember.cc'
+    HD_HOSTS = ['https://tideember.cc', 'https://xqjurgek.top']
+    HD_PLATFORM_KEY = '7961beb44246e3012ce228d6b5ced05a'
+    HD_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+    HD_CATS = [
+        ('', '全部'), ('黄豆原创', '黄豆原创'), ('国漫', '国漫'), ('沙雕', '沙雕'),
+        ('大神精选', '大神精选'), ('擦边短剧', '擦边短剧'), ('国漫AI', '国漫AI'),
+        ('单体作品', '单体作品'), ('漫剧', '漫剧'), ('影视魔改', '影视魔改'),
+        ('里番', '里番'), ('糖心', '糖心'),
+    ]
+
+    
+    HJ_API = 'https://api.huangju.net'
+    HJ_SITE = 'https://huangju.net'
+    HJ_CATS = [
+        ('@new', '最新'), ('adult', '成人'), ('mo-gai', '魔改'), ('romance', '爱情'),
+        ('urban', '都市'), ('fantasy', '玄幻'), ('modern-romance', '现言'),
+        ('ancient-romance', '古言'), ('brain-hole', '脑洞'), ('suspense', '悬疑'),
+        ('sweet-love', '甜宠'), ('chuan-yue', '穿越'), ('qing-chun', '青春'),
+        ('xian-xia', '仙侠'), ('ling-yi', '灵异'), ('xi-ju', '喜剧'),
+        ('zhong-tian', '种田'), ('ke-huan', '科幻'), ('family', '家庭'),
+        ('revenge', '复仇'), ('gong-dou', '宫斗'), ('du-jia-yuan-chuang', '独家原创'),
+        ('nu-xing-cheng-zhang', '女性成长'), ('wu-xia', '武侠'),
+    ]
+
+    def init(self, extend=''):
+        try:
+            self.ext = json.loads(extend) if extend else {}
+        except Exception:
+            self.ext = {}
+
+    def getName(self):
+        return '果果聚合'
+
+    def isVideoFormat(self, url):
+        return False
+
+    def manualVideoCheck(self):
+        return False
+
+    def getDependence(self):
+        return []
+
+    def destroy(self):
+        pass
+
+    
+
+    def _log(self, msg):
+        try:
+            log = getattr(self, 'log', None)
+            if log:
+                log(str(msg))
+        except Exception:
+            pass
+
+    def _cacheGet(self, key):
+        try:
+            g = getattr(self, 'getCache', None)
+            if g:
+                return g(key) or ''
+        except Exception:
+            pass
+        return ''
+
+    def _cacheSet(self, key, value):
+        try:
+            s = getattr(self, 'setCache', None)
+            if s:
+                s(key, str(value))
+        except Exception:
+            pass
+
+    def _sess(self):
+        s = getattr(self, '_session', None)
+        if s is None:
+            s = requests.Session()
+            self._session = s
+        return s
+
+    def _fetch(self, url, headers=None, timeout=15, tries=2):
+        hdr = {'User-Agent': self.UA}
+        if headers:
+            hdr.update(headers)
+        last = None
+        for _ in range(tries):
+            try:
+                r = self._sess().get(url, headers=hdr, timeout=timeout)
+                r.encoding = 'utf-8'
+                return r
+            except Exception as e:
+                last = e
+        raise last
+
+    def _post(self, url, data=None, headers=None, timeout=15, tries=2):
+        hdr = {'User-Agent': self.UA}
+        if headers:
+            hdr.update(headers)
+        last = None
+        for _ in range(tries):
+            try:
+                r = self._sess().post(url, data=data, headers=hdr, timeout=timeout)
+                r.encoding = 'utf-8'
+                return r
+            except Exception as e:
+                last = e
+        raise last
+
+    def _json(self, r, default=None):
+        try:
+            return r.json()
+        except Exception:
+            return default if default is not None else {}
+
+    def _tostr(self, v):
+        try:
+            if v is None:
+                return ''
+            return str(v).strip()
+        except Exception:
+            return ''
+
+    def _safe(self, s):
+        s = self._tostr(s)
+        return s.replace('#', '').replace('$', '').strip()
+
+    def _epName(self, num, title='', total=0, pad=False):
+        t = self._safe(title)
+        if t:
+            return t
+        n = self._tostr(num)
+        if not n:
+            n = '1'
+        if pad:
+            try:
+                width = max(2, len(str(total)) if total else 2)
+                return n.zfill(width)
+            except Exception:
+                return n
+        return n
+
+    
+    def _rmk(self, s):
+        s = self._tostr(s).strip()
+        if not s:
+            return ''
+        if re.search(r'\d+\s*[:：]\s*\d{2}', s):
+            return s
+        if '集' in s and re.search(r'\d', s):
+            return s
+        return ''
+
+    def _join(self, base, url):
+        url = self._tostr(url)
+        if not url:
+            return ''
+        if url.startswith('http://') or url.startswith('https://'):
+            return url
+        if url.startswith('//'):
+            return 'https:' + url
+        base = base.rstrip('/')
+        if url.startswith('/'):
+            return base + url
+        return base + '/' + url
+
+    def _src(self, sid):
+        sid = self._tostr(sid)
+        if ':' in sid:
+            parts = sid.split(':', 1)
+            return parts[0], parts[1]
+        return '', sid
+
+    def _pagebase(self, pg):
+        pg = self._tostr(pg)
+        if pg.isdigit():
+            pg = int(pg)
+        else:
+            pg = 1
+        return pg
+
+    def _emptyCat(self, pg):
+        return {'list': [], 'page': pg, 'pagecount': pg, 'limit': 24, 'total': 0}
+
+    def _emptyDetail(self):
+        return {'list': []}
+
+    def _hint(self, name, remarks=''):
+        return {'vod_id': 'sgp6:hint', 'vod_name': name, 'vod_pic': '', 'vod_remarks': remarks}
+
+    def _prefixMap(self):
+        return {name: key for key, name in self.SOURCES}
+
+    
+    
+    
+
+    def _pic(self, url):
+        u = self._tostr(url)
+        if not u:
+            return ''
+        if not u.startswith('http'):
+            return u
+        return ('http://127.0.0.1:9978/proxy?do=py&type=pic&url=' +
+                urllib.parse.quote(u, safe=''))
+    
+    
+    
+    
+    
+    
+
+    def _hg_headers(self, slug=''):
+        return {'Referer': self.HG_BASE + ('/' + slug + '/' if slug else '/')}
+
+    
+    def _hg_pic(self, u):
+        u = self._tostr(u)
+        if 'pic.wirqed.cn/' in u:
+            u = u.split('?')[0]
+        return self._pic(u)
+
+    def _hg_item(self, it):
+        try:
+            sid = self._tostr(it.get('id'))
+            if not sid:
+                return {}
+            ec = it.get('episode_count') or it.get('total_episodes') or 0
+            try:
+                ec = int(ec)
+            except Exception:
+                ec = 0
+            rem = ''
+            if ec:
+                fin = it.get('is_finished')
+                rem = ('全%d集' if fin else '更新至%d集') % ec
+            return {
+                'vod_id': 'hg:' + sid,
+                'vod_name': self._tostr(it.get('title')),
+                'vod_pic': self._hg_pic(it.get('cover')),
+                'vod_remarks': self._rmk(rem),
+            }
+        except Exception:
+            return {}
+
+    def _hg_category(self, cat, by, pg):
+        try:
+            r = self._fetch(self.HG_BASE + '/api/videos/category/' + cat +
+                            '?sort=' + by + '&page=' + str(pg) + '&size=24',
+                            headers=self._hg_headers(cat))
+            data = self._json(r).get('data') or {}
+            recs = data.get('items') or []
+            items = [i for i in (self._hg_item(it) for it in recs) if i]
+            pagination = data.get('pagination') or {}
+            tp = pagination.get('pages') or 0
+            try:
+                tp = int(tp)
+            except Exception:
+                tp = 0
+            if tp <= 0:
+                tp = pg if len(items) < 24 else pg + 1
+            return {'list': items, 'page': pg, 'pagecount': tp, 'limit': 24, 'total': len(items)}
+        except Exception:
+            return self._emptyCat(pg)
+
+    def _hg_detail(self, vid):
+        try:
+            r = self._fetch(self.HG_BASE + '/api/videos/' + urllib.parse.quote(str(vid), safe=''),
+                            headers=self._hg_headers())
+            d = self._json(r).get('data') or {}
+            eps = []
+            for ep in (d.get('episodes') or []):
+                num = self._tostr(ep.get('ep_num'))
+                if not num:
+                    continue
+                total = len(d.get('episodes') or [])
+                name = self._epName(num, '', total, pad=True)
+                eps.append('%s$hg:%s:%s' % (name, vid, num))
+            if not eps:
+                return self._emptyDetail()
+            return {'list': [{
+                'vod_id': 'hg:' + vid,
+                'vod_name': self._tostr(d.get('title')),
+                'vod_pic': self._hg_pic(d.get('cover')),
+                'vod_remarks': '接口免费',
+                'vod_content': '接口免费',
+                'vod_play_from': '黄果短剧',
+                'vod_play_url': '#'.join(eps),
+            }]}
+        except Exception:
+            return self._emptyDetail()
+
+    def _hg_play(self, cid):
+        try:
+            vid, _, ep = self._tostr(cid).partition(':')
+            if not vid:
+                return {}
+            if not ep:
+                ep = '1'
+            r = self._fetch(self.HG_BASE + '/api/videos/' + urllib.parse.quote(vid, safe='') +
+                            '/play?ep=' + urllib.parse.quote(ep, safe=''),
+                            headers=self._hg_headers())
+            url = self._tostr((self._json(r).get('data') or {}).get('video_url'))
+            if not url:
+                return {}
+            return {'parse': 0, 'url': url,
+                    'header': {'Referer': self.HG_BASE + '/', 'User-Agent': self.UA}}
+        except Exception:
+            return {}
+
+    def _hg_search(self, kw, pg):
+        try:
+            r = self._fetch(self.HG_BASE + '/api/search?q=' + urllib.parse.quote(kw),
+                            headers=self._hg_headers())
+            recs = (self._json(r).get('data') or {}).get('items') or []
+            items = [i for i in (self._hg_item(it) for it in recs) if i]
+            return items
+        except Exception:
+            return []
+    
+    
+    
+    
+    
+    
+    
+
+    def _php_headers(self, site):
+        return {'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': site, 'Referer': site + '/'}
+
+    def _php_decrypt(self, s):
+        try:
+            raw = base64.b64decode(s)
+            if not raw or len(raw) % 16 != 0 or AES is None:
+                return None
+            d = AES.new(self.PHP_KEY, AES.MODE_CBC, self.PHP_IV).decrypt(raw)
+            pad = d[-1]
+            if 1 <= pad <= 16 and all(b == pad for b in d[-pad:]):
+                d = d[:-pad]
+            return json.loads(d.decode('utf-8', 'ignore'))
+        except Exception:
+            return None
+
+    def _php_call(self, api, site, path, body):
+        try:
+            r = self._post(api + path, data=body, headers=self._php_headers(site), timeout=20)
+            j = self._json(r)
+            v = j.get('data')
+            if isinstance(v, str) and len(v) > 20:
+                d = self._php_decrypt(v)
+                if d is not None:
+                    return d
+            return j
+        except Exception:
+            return {}
+
+    def _php_item(self, it, key):
+        try:
+            vid = self._tostr(it.get('video_id') or it.get('id'))
+            if not vid:
+                return {}
+            return {
+                'vod_id': key + ':' + vid,
+                'vod_name': self._tostr(it.get('title') or it.get('video_title')),
+                'vod_pic': self._pic(it.get('cover') or it.get('cover_img')),
+                'vod_remarks': self._rmk(it.get('serialize_status_text')) or
+                               ('共%s集' % it.get('episode_count') if it.get('episode_count') else ''),
+            }
+        except Exception:
+            return {}
+
+    def _php_category(self, key, api, site, cat, pg):
+        try:
+            size = 20
+            body = {'page': str(pg), 'limit': str(size)}
+            if cat == 'rank':
+                path = '/api/theater/videoRank'
+            elif cat.startswith('bg'):
+                path = '/api/theater/exploreList'
+                body['background'] = cat[2:]
+            elif cat.startswith('st'):
+                path = '/api/theater/exploreList'
+                body['setting'] = cat[2:]
+            else:
+                path = '/api/theater/exploreList'
+            d = self._php_call(api, site, path, body)
+            data = d.get('data') or {}
+            recs = data.get('list') or []
+            items = [i for i in (self._php_item(it, key) for it in recs) if i]
+            total = data.get('total') or 0
+            try:
+                total = int(total)
+            except Exception:
+                total = 0
+            tp = (total + size - 1) // size if total else (pg + 1 if len(items) >= size else pg)
+            return {'list': items, 'page': pg, 'pagecount': tp, 'limit': size, 'total': total}
+        except Exception:
+            return self._emptyCat(pg)
+
+    def _php_detail(self, key, api, site, vid):
+        try:
+            d = self._php_call(api, site, '/api/playlet/detail', {'video_id': vid})
+            info = d.get('data') or {}
+            if not info and isinstance(d.get('data'), dict):
+                info = d.get('data')
+            eps = []
+            for ep in (info.get('episodes') or []):
+                num = self._tostr(ep.get('sort') or ep.get('id'))
+                if not num:
+                    continue
+                total = len(info.get('episodes') or [])
+                name = self._epName(num, ep.get('title'), total)
+                eps.append('%s$%s:%s:%s' % (name, key, vid, num))
+            if not eps:
+                return self._emptyDetail()
+            return {'list': [{
+                'vod_id': key + ':' + vid,
+                'vod_name': self._tostr(info.get('title')),
+                'vod_pic': self._pic(info.get('cover') or info.get('cover_img')),
+                'vod_remarks': '接口免费',
+                'vod_content': '接口免费',
+                'vod_play_from': '野果专线',
+                'vod_play_url': '#'.join(eps),
+            }]}
+        except Exception:
+            return self._emptyDetail()
+
+    def _php_play(self, api, site, cid):
+        try:
+            vid, _, ep = self._tostr(cid).partition(':')
+            if not vid:
+                return {}
+            d = self._php_call(api, site, '/api/playlet/play',
+                               {'video_id': vid, 'ep': ep or '1'})
+            info = d.get('data') or {}
+            url = self._tostr(info.get('video_url'))
+            if not url:
+                ea = info.get('episodeAll') or []
+                for it in ea:
+                    if self._tostr(it.get('sort')) == (ep or '1'):
+                        url = self._tostr(it.get('video_url'))
+                        break
+            if not url:
+                return {}
+            return {'parse': 0, 'url': url,
+                    'header': {'Referer': site + '/', 'Origin': site, 'User-Agent': self.UA}}
+        except Exception:
+            return {}
+
+    def _php_search(self, key, api, site, kw, pg):
+        try:
+            d = self._php_call(api, site, '/api/search/result',
+                               {'keyword': kw, 'page': str(pg)})
+            recs = (d.get('data') or {}).get('list') or []
+            items = [i for i in (self._php_item(it, key) for it in recs) if i]
+            return items
+        except Exception:
+            return []
+
+    
+
+    def _yg_category(self, cat, pg):
+        return self._php_category('yg', self.YG_API, self.YG_SITE, cat, pg)
+
+    def _yg_detail(self, vid):
+        return self._php_detail('yg', self.YG_API, self.YG_SITE, vid)
+
+    def _yg_play(self, cid):
+        return self._php_play(self.YG_API, self.YG_SITE, cid)
+
+    def _yg_search(self, kw, pg):
+        return self._php_search('yg', self.YG_API, self.YG_SITE, kw, pg)
+
+    
+
+    def _wj_category(self, cat, pg):
+        return self._php_category('wj', self.WJ_API, self.WJ_SITE, cat, pg)
+
+    def _wj_detail(self, vid):
+        return self._php_detail('wj', self.WJ_API, self.WJ_SITE, vid)
+
+    def _wj_play(self, cid):
+        return self._php_play(self.WJ_API, self.WJ_SITE, cid)
+
+    def _wj_search(self, kw, pg):
+        return self._php_search('wj', self.WJ_API, self.WJ_SITE, kw, pg)
+    
+    
+    
+    
+    
+    
+    
+
+    def _jg_device(self):
+        d = self._cacheGet('sgp6_jg_did')
+        if d:
+            return d
+        d = ''.join(random.choice('0123456789abcdef') for _ in range(32))
+        self._cacheSet('sgp6_jg_did', d)
+        return d
+
+    def _jg_headers(self):
+        h = {'Accept': 'application/json, text/plain, */*',
+             'Accept-Language': 'zh-CN,zh;q=0.9',
+             'Content-Type': 'application/json;charset=UTF-8',
+             'Origin': self.JG_API, 'Referer': self.JG_API + '/',
+             'User-Agent': self.JG_UA}
+        t = self._cacheGet('sgp6_jg_token')
+        if not t:
+            try:
+                r = self._post(self.JG_API + '/api/v1/auth/device',
+                               data=json.dumps({'deviceId': 'h5:' + self._jg_device(),
+                                                'channelCode': '', 'attributionToken': ''}),
+                               headers={'Content-Type': 'application/json;charset=UTF-8',
+                                        'Origin': self.JG_API, 'Referer': self.JG_API + '/',
+                                        'User-Agent': self.JG_UA}, timeout=15)
+                t = self._tostr((self._json(r) or {}).get('token'))
+                if t:
+                    self._cacheSet('sgp6_jg_token', t)
+            except Exception:
+                t = ''
+        if t:
+            h['Authorization'] = 'Bearer ' + t
+        return h
+
+    def _jg_get(self, url, retry=True):
+        r = self._fetch(url, headers=self._jg_headers())
+        if r.status_code in (401, 403) and retry:
+            self._cacheSet('sgp6_jg_token', '')
+            r = self._fetch(url, headers=self._jg_headers())
+        return r
+
+    def _jg_fix_cover(self, u):
+        raw = self._tostr(u)
+        if not raw:
+            return ''
+        if raw.startswith('http'):
+            return raw
+        if raw.startswith('//'):
+            return 'https:' + raw
+        return self.JG_API + '/' + raw.lstrip('/')
+
+    def _jg_item(self, it):
+        try:
+            vid = self._tostr(it.get('id'))
+            if not vid:
+                return {}
+            ep = it.get('episodeCount')
+            return {
+                'vod_id': 'jg:' + vid,
+                'vod_name': self._tostr(it.get('title')),
+                'vod_pic': self._jg_fix_cover(it.get('coverUrl') or it.get('cover')),
+                'vod_remarks': ('共%s集' % ep) if ep else '',
+            }
+        except Exception:
+            return {}
+
+    def _jg_category(self, cat, pg):
+        try:
+            size = 20
+            q = {}
+            if cat in ('latest', 'heat'):
+                q['sort'] = cat
+            elif cat.startswith('nav_'):
+                q['sort'] = 'latest'
+                q['navigationId'] = cat.split('_')[1]
+            else:
+                q['sort'] = 'latest'
+            ckey = 'sgp6_jg_cat_' + cat
+            tkey = 'sgp6_jg_cat_ts_' + cat
+            arr = None
+            try:
+                cached = self._cacheGet(ckey)
+                ts = self._cacheGet(tkey)
+                fresh = False
+                if ts:
+                    try:
+                        fresh = (int(time.time()) - int(ts)) < 600
+                    except Exception:
+                        fresh = False
+                if cached and fresh:
+                    arr = json.loads(cached)
+            except Exception:
+                arr = None
+            if not isinstance(arr, list) or not arr:
+                url = self.JG_API + '/api/v1/dramas?' + urllib.parse.urlencode(q)
+                r = self._jg_get(url)
+                arr = self._json(r, [])
+                if isinstance(arr, list) and arr:
+                    try:
+                        self._cacheSet(ckey, json.dumps(arr, ensure_ascii=False))
+                        self._cacheSet(tkey, str(int(time.time())))
+                    except Exception:
+                        pass
+            all_items = [i for i in (self._jg_item(it) for it in arr) if i] if isinstance(arr, list) else []
+            total = len(all_items)
+            start = (pg - 1) * size
+            page_items = all_items[start:start + size]
+            tp = (total + size - 1) // size if total else 1
+            if tp < pg:
+                tp = pg
+            return {'list': page_items, 'page': pg, 'pagecount': tp, 'limit': size, 'total': total}
+        except Exception:
+            return self._emptyCat(pg)
+
+    def _jg_detail(self, vid):
+        try:
+            r = self._jg_get(self.JG_API + '/api/v1/dramas/' + urllib.parse.quote(str(vid), safe=''))
+            d = self._json(r) or {}
+            drama = d.get('drama') or {}
+            eps = d.get('episodes') or []
+            play_urls = []
+            for ep in eps:
+                n = self._tostr(ep.get('number'))
+                eid = self._tostr(ep.get('id'))
+                t_name = self._epName(n, ep.get('title'), len(eps))
+                play_urls.append('%s$jg:%s:%s' % (t_name, vid, eid))
+            if not play_urls:
+                return self._emptyDetail()
+            return {'list': [{
+                'vod_id': 'jg:' + vid,
+                'vod_name': self._tostr(drama.get('title')),
+                'vod_pic': self._jg_fix_cover(drama.get('coverUrl') or drama.get('cover')),
+                'vod_remarks': '接口免费',
+                'vod_content': '接口免费',
+                'vod_play_from': '禁果专线',
+                'vod_play_url': '#'.join(play_urls),
+            }]}
+        except Exception:
+            return self._emptyDetail()
+
+    def _jg_play(self, cid):
+        try:
+            vid, _, eid = self._tostr(cid).partition(':')
+            if not vid:
+                return {}
+            if not eid:
+                r = self._jg_get(self.JG_API + '/api/v1/dramas/' + urllib.parse.quote(vid, safe=''))
+                eps = (self._json(r) or {}).get('episodes') or []
+                eid = self._tostr(eps[0].get('id')) if eps else ''
+            if not eid:
+                return {}
+            r = self._jg_get(self.JG_API + '/api/v1/episodes/' + urllib.parse.quote(eid, safe='') + '/play')
+            url = self._tostr((self._json(r) or {}).get('videoUrl'))
+            if not url:
+                return {}
+            return {'parse': 0, 'url': url,
+                    'header': {'Referer': self.JG_API + '/', 'Origin': self.JG_API,
+                               'User-Agent': self.JG_UA}}
+        except Exception:
+            return {}
+
+    def _jg_search(self, kw, pg):
+        try:
+            url = self.JG_API + '/api/v1/dramas?' + urllib.parse.urlencode({'sort': 'latest', 'q': kw})
+            r = self._jg_get(url)
+            arr = self._json(r, [])
+            items = [i for i in (self._jg_item(it) for it in arr) if i] if isinstance(arr, list) else []
+            size = 20
+            total = len(items)
+            start = (pg - 1) * size
+            return items[start:start + size]
+        except Exception:
+            return []
+    
+    
+    
+    
+    
+
+    def _aes_encrypt(self, plain, key, iv):
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import pad
+        return AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plain, 16))
+
+    def _hd_uuid(self):
+        raw = ''.join(['%02x' % random.randrange(256) for _ in range(16)])
+        return raw[:8] + '-' + raw[8:12] + '-' + raw[12:16] + '-' + raw[16:20] + '-' + raw[20:]
+
+    def _hd_hosts(self):
+        
+        hosts = self.HD_HOSTS
+        idx = getattr(self, '_hd_host_idx', None)
+        if idx is None or not isinstance(idx, int) or idx < 0 or idx >= len(hosts):
+            return list(hosts)
+        return [hosts[idx]] + [h for i, h in enumerate(hosts) if i != idx]
+
+    def _hd_call(self, path, data):
+        last_err = ''
+        
+        tries = 2 if getattr(self, '_hd_host_idx', None) is not None else 1
+        for host in self._hd_hosts():
+            try:
+                rid = self._hd_uuid()
+                device_id = self._hd_uuid()
+                key = hmac.new(self.HD_PLATFORM_KEY.encode('utf-8'),
+                               bytes.fromhex(rid.replace('-', '')), hashlib.sha256).digest()
+                iv = os.urandom(16)
+                plain = json.dumps({'token': '', 'deviceId': device_id, 'data': data},
+                                   separators=(',', ':')).encode('utf-8')
+                cipher = self._aes_encrypt(gzip.compress(plain), key, iv)
+                t = str(int(time.time()))
+                sign = hashlib.sha256(('Dart|%s|%s|%s|%s' % (device_id, rid, t, path)).encode('utf-8')).hexdigest() + '-' + t
+                headers = {
+                    'User-Agent': self.HD_UA, 'Accept': '*/*',
+                    'Origin': host, 'Referer': host + '/home',
+                    'Content-Type': 'application/octet-stream',
+                    'version': '2.0.0', 'deviceType': 'web',
+                    'requestId': rid, 'sessionId': device_id, 'time': t, 'sign': sign,
+                }
+                r = self._post(host + '/api' + path, data=iv + cipher, headers=headers, timeout=15, tries=tries)
+                self._hd_host_idx = self.HD_HOSTS.index(host)
+                blob = r.content
+                try:
+                    return json.loads(blob)
+                except Exception:
+                    pass
+                if len(blob) < 32:
+                    raise Exception('response too short')
+                from Crypto.Cipher import AES
+                from Crypto.Util.Padding import unpad
+                plain2 = unpad(AES.new(key, AES.MODE_CBC, blob[:16]).decrypt(blob[16:]), 16)
+                if plain2[:2] == b'\x1f\x8b':
+                    plain2 = gzip.decompress(plain2)
+                return json.loads(plain2)
+            except Exception as e:
+                last_err = str(e)
+        raise Exception(last_err or 'huangdou failed')
+
+    def _hd_item(self, it):
+        try:
+            did = self._tostr(it.get('id') or it.get('drama_id'))
+            if did.startswith('rp_'):
+                did = did[3:]
+            if not did:
+                return {}
+            rem = self._rmk(self._tostr(it.get('update_label') or it.get('corner')))
+            if not rem and it.get('episode_count'):
+                rem = '共%s集' % it.get('episode_count')
+            return {
+                'vod_id': 'hd:' + did,
+                'vod_name': self._tostr(it.get('name') or it.get('title') or it.get('t')),
+                'vod_pic': self._tostr(it.get('img') or it.get('img_y') or it.get('img_x') or it.get('cover') or it.get('pic')),
+                'vod_remarks': rem,
+            }
+        except Exception:
+            return {}
+
+    def _hd_list(self, page, size):
+        
+        j = self._hd_call('/drama/list', {'page': str(page), 'page_size': str(size)})
+        data = j.get('data') or {}
+        if isinstance(data, dict):
+            return data.get('list') or data.get('items') or data.get('data') or []
+        return []
+
+    
+    
+    def _hd_pool(self, need, max_new=3):
+        now = int(time.time())
+        p = getattr(self, '_hd_pool_v', None)
+        if p is None or now - p.get('_ts', 0) > 1800:
+            p = {'_items': [], '_ids': set(), '_pages': 0, '_done': False, '_ts': now}
+            self._hd_pool_v = p
+        grown = 0
+        while not p['_done'] and len(p['_items']) < need and grown < max_new:
+            p['_pages'] += 1
+            try:
+                recs = self._hd_list(p['_pages'], 1000)
+            except Exception:
+                recs = []
+            if not recs:
+                p['_done'] = True
+                break
+            for it in recs:
+                did = self._tostr(it.get('id') or it.get('drama_id'))
+                if not did or did in p['_ids']:
+                    continue
+                p['_ids'].add(did)
+                item = self._hd_item(it)
+                if item:
+                    item['_cat'] = self._tostr(it.get('category'))
+                    p['_items'].append(item)
+            grown += 1
+            if len(recs) < 1000:
+                p['_done'] = True
+                break
+        return p
+
+    def _hd_category(self, cat, pg):
+        try:
+            size = 30
+            p = self._hd_pool(pg * size)
+            if cat:
+                
+                if not p['_done']:
+                    matched = sum(1 for i in p['_items'] if i.get('_cat') == cat)
+                    if matched < pg * size:
+                        before = len(p['_items'])
+                        p = self._hd_pool(before + 1000)
+                sub = [i for i in p['_items'] if i.get('_cat') == cat]
+            else:
+                sub = p['_items']
+            total = len(sub)
+            start = (pg - 1) * size
+            page_items = []
+            for i in sub[start:start + size]:
+                page_items.append({'vod_id': i['vod_id'], 'vod_name': i['vod_name'],
+                                   'vod_pic': i['vod_pic'], 'vod_remarks': i['vod_remarks']})
+            if p['_done']:
+                tp = (total + size - 1) // size if total else 1
+                if tp < pg:
+                    tp = pg
+            else:
+                tp = pg + 1 if len(page_items) >= size else pg
+            return {'list': page_items, 'page': pg, 'pagecount': tp, 'limit': size, 'total': total}
+        except Exception as e:
+            self._log('hd category err: %s' % e)
+            return self._emptyCat(pg)
+
+    def _hd_detail(self, vid):
+        try:
+            j = self._hd_call('/drama/detail', {'id': vid})
+            data = j.get('data') or {}
+            episodes = data.get('episodes') or []
+            eps = []
+            for i, ep in enumerate(episodes):
+                seq = self._tostr(ep.get('seq') or ep.get('episode') or ep.get('ep') or (i + 1))
+                name = self._epName(seq, ep.get('name') or ep.get('title'), len(episodes))
+                eps.append('%s$hd:%s:%s' % (name, vid, seq))
+            if not eps:
+                return self._emptyDetail()
+            return {'list': [{
+                'vod_id': 'hd:' + vid,
+                'vod_name': self._tostr(data.get('name') or data.get('title')),
+                'vod_pic': self._tostr(data.get('img') or data.get('img_y') or data.get('img_x') or data.get('cover')),
+                'vod_remarks': '接口免费',
+                'vod_content': '接口免费',
+                'vod_play_from': '黄豆',
+                'vod_play_url': '#'.join(eps),
+            }]}
+        except Exception:
+            return self._emptyDetail()
+
+    def _hd_play(self, vid, seq):
+        try:
+            j = self._hd_call('/drama/play', {'id': vid, 'seq': str(seq)})
+            data = j.get('data') or {}
+            lines = data.get('lines') or []
+            url = self._tostr(data.get('m3u8') or data.get('url') or data.get('play_url') or data.get('playUrl'))
+            hdr = {'Referer': self.HD_BASE + '/home', 'User-Agent': self.HD_UA}
+            if lines:
+                arr = []
+                for ln in lines:
+                    u = self._tostr(ln.get('url'))
+                    if u:
+                        arr.append(self._tostr(ln.get('name')) or '播放')
+                        arr.append(u)
+                if arr:
+                    return {'parse': 0, 'url': arr, 'header': hdr}
+            if not url:
+                return {}
+            return {'parse': 0, 'url': url, 'header': hdr}
+        except Exception:
+            return {}
+    
+    
+
+    def _hj_device(self):
+        d = self._cacheGet('sgp6_hj_did')
+        if d:
+            return d
+        d = str(uuid.uuid4())
+        self._cacheSet('sgp6_hj_did', d)
+        return d
+
+    def _hj_token(self):
+        t = getattr(self, '_hj_token_v', '') or ''
+        if t:
+            return t
+        try:
+            r = self._post(self.HJ_API + '/auth/guest',
+                           data=json.dumps({'deviceId': self._hj_device()}),
+                           headers={'Content-Type': 'application/json',
+                                    'Referer': self.HJ_SITE + '/', 'Origin': self.HJ_SITE,
+                                    'Accept': 'application/json, text/plain, */*'})
+            j = self._json(r)
+            t = j.get('token') or (j.get('data') or {}).get('token') or ''
+            if t:
+                self._hj_token_v = t
+                self._cacheSet('sgp6_hj_token', t)
+        except Exception:
+            t = ''
+        return t
+
+    def _hj_headers(self):
+        h = {'Accept': 'application/json, text/plain, */*', 'Accept-Language': 'zh-CN,zh;q=0.9',
+             'Referer': self.HJ_SITE + '/', 'Origin': self.HJ_SITE}
+        t = self._hj_token()
+        if t:
+            h['Authorization'] = 'Bearer ' + t
+        return h
+
+    def _hj_get(self, url, retry=True):
+        r = self._fetch(url, headers=self._hj_headers())
+        if r.status_code in (401, 403) and retry:
+            self._hj_token_v = ''
+            self._cacheSet('sgp6_hj_token', '')
+            r = self._fetch(url, headers=self._hj_headers())
+        return r
+
+    def _hj_item(self, it):
+        try:
+            did = self._tostr(it.get('id'))
+            slug = self._tostr(it.get('slug'))
+            if not did or not slug:
+                return {}
+            rem = ''
+            te = it.get('totalEpisodes')
+            if te:
+                rem = '共%s集' % te
+            return {
+                'vod_id': 'hj:%s-%s' % (slug, did),
+                'vod_name': self._tostr(it.get('title')),
+                'vod_pic': self._tostr(it.get('coverUrl')),
+                'vod_remarks': self._rmk(rem),
+            }
+        except Exception:
+            return {}
+
+    def _hj_category(self, cat, pg):
+        try:
+            values = {'page': str(pg), 'size': '20'}
+            if cat == '@new':
+                values['sort'] = 'new'
+            elif cat:
+                values['category'] = cat
+            url = self.HJ_API + '/dramas?' + urllib.parse.urlencode(values)
+            r = self._fetch(url, headers=self._hj_headers())
+            j = self._json(r)
+            total = j.get('total') or 0
+            try:
+                total = int(total)
+            except Exception:
+                total = 0
+            recs = j.get('items') or []
+            items = [i for i in (self._hj_item(it) for it in recs) if i]
+            tp = (total + 19) // 20 if total > 0 else (pg + 1 if len(items) >= 20 else pg)
+            return {'list': items, 'page': pg, 'pagecount': tp, 'limit': 20, 'total': total or len(items)}
+        except Exception:
+            return self._emptyCat(pg)
+
+    def _hj_detail(self, vid):
+        try:
+            r = self._hj_get(self.HJ_API + '/dramas/' + urllib.parse.quote(vid, safe=''))
+            d = self._json(r)
+            if d.get('error') or d.get('statusCode'):
+                self._hj_token_v = ''
+                self._cacheSet('sgp6_hj_token', '')
+                r = self._hj_get(self.HJ_API + '/dramas/' + urllib.parse.quote(vid, safe=''), retry=False)
+                d = self._json(r)
+            episodes = d.get('episodes') or []
+            eps = []
+            for ep in episodes:
+                if ep.get('playable') is False:
+                    continue
+                eid = self._tostr(ep.get('id'))
+                if not eid:
+                    continue
+                name = self._epName(ep.get('epNo'), ep.get('title'), len(episodes))
+                eps.append('%s$hj:%s' % (name, eid))
+            if not eps:
+                return self._emptyDetail()
+            return {'list': [{
+                'vod_id': 'hj:' + vid,
+                'vod_name': self._tostr(d.get('title')),
+                'vod_pic': self._tostr(d.get('coverUrl')),
+                'vod_remarks': '接口免费',
+                'vod_content': '接口免费',
+                'vod_play_from': '黄剧',
+                'vod_play_url': '#'.join(eps),
+            }]}
+        except Exception:
+            return self._emptyDetail()
+
+    def _hj_search(self, kw, pg):
+        try:
+            r = self._hj_get(self.HJ_API + '/dramas?q=' + urllib.parse.quote(kw) +
+                             '&page=' + str(pg) + '&size=20')
+            recs = self._json(r).get('items') or []
+            return [i for i in (self._hj_item(it) for it in recs) if i]
+        except Exception:
+            return []
+
+    def _hj_play(self, eid):
+        try:
+            r = self._hj_get(self.HJ_API + '/play/' + eid)
+            j = self._json(r)
+            url = self._tostr(j.get('url'))
+            if not url:
+                return {}
+            header = {'Referer': self.HJ_SITE + '/', 'User-Agent': self.UA}
+            try:
+                cookies = '; '.join(['%s=%s' % (c.name, c.value) for c in r.cookies])
+                if cookies:
+                    header['Cookie'] = cookies
+            except Exception:
+                pass
+            return {'parse': 0, 'url': url, 'header': header}
+        except Exception:
+            return {}
+    
+
+    def localProxy(self, param):
+        try:
+            p = param if isinstance(param, dict) else {}
+            if p.get('type') == 'pic':
+                return self._proxyPic(p)
+        except Exception as e:
+            self._log('localProxy err: %s' % e)
+        return [404, 'text/plain; charset=utf-8', '']
+
+    
+    def _proxyPic(self, params):
+        u = self._tostr(params.get('url'))
+        if not u.startswith('http'):
+            return [404, 'text/plain; charset=utf-8', 'bad url']
+        try:
+            r = requests.get(u, headers={'User-Agent': self.UA, 'Referer': '*',
+                                         'Accept': 'image/*'}, timeout=15, verify=False)
+            data = r.content
+            if not data:
+                return [404, 'text/plain; charset=utf-8', 'empty']
+            img = self._decryptImg(data)
+            if not img:
+                return [404, 'text/plain; charset=utf-8', 'decrypt fail']
+            mime = self._imgMime(img)
+            return [200, mime, img]
+        except Exception as e:
+            self._log('proxyPic err: %s' % e)
+            return [404, 'text/plain; charset=utf-8', 'err']
+
+    @staticmethod
+    def _isPlainImg(data):
+        return (data[:3] == b'\xff\xd8\xff' or data[:8] == b'\x89PNG\r\n\x1a\n'
+                or data[:6] in (b'GIF87a', b'GIF89a')
+                or (data[:4] == b'RIFF' and data[8:12] == b'WEBP'))
+
+    def _decryptImg(self, data):
+        if not data:
+            return b''
+        if self._isPlainImg(data):
+            return data
+        if AES is None or len(data) % 16 != 0:
+            return b''
+        try:
+            dec = AES.new(self.MEDIA_KEY, AES.MODE_CBC, self.MEDIA_IV).decrypt(data)
+            pad = dec[-1]
+            if 1 <= pad <= 16 and all(b == pad for b in dec[-pad:]):
+                dec = dec[:-pad]
+            else:
+                dec = dec.rstrip(b'\x00')
+            if self._isPlainImg(dec):
+                return dec
+            return dec
+        except Exception:
+            return b''
+
+    @staticmethod
+    def _imgMime(data):
+        if data[:3] == b'\xff\xd8\xff':
+            return 'image/jpeg'
+        if data[:8] == b'\x89PNG\r\n\x1a\n':
+            return 'image/png'
+        if data[:6] in (b'GIF87a', b'GIF89a'):
+            return 'image/gif'
+        if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+            return 'image/webp'
+        return 'image/jpeg'
+
+    
+
+    def homeContent(self, filter):
+        classes = [{'type_id': k, 'type_name': n} for k, n in self.SOURCES]
+        filters = {
+            'hg': [
+                {'name': '分类', 'key': 'cat', 'value': [{'n': n, 'v': v} for v, n in self.HG_CATS]},
+                {'name': '排序', 'key': 'by', 'value': [{'n': n, 'v': v} for v, n in self.HG_SORTS]},
+            ],
+            'yg': [
+                {'name': '分类', 'key': 'cat', 'value': [{'n': '推荐', 'v': ''}] +
+                 [{'n': '排行榜', 'v': 'rank'}] +
+                 [{'n': n, 'v': 'bg' + v} for v, n in self.YG_BG] +
+                 [{'n': n, 'v': 'st' + v} for v, n in self.YG_SET]},
+            ],
+            'jg': [
+                {'name': '分类', 'key': 'cat', 'value': [{'n': n, 'v': v} for v, n in self.JG_CATS]},
+            ],
+            'wj': [
+                {'name': '分类', 'key': 'cat', 'value': [{'n': '推荐', 'v': ''}] +
+                 [{'n': '排行榜', 'v': 'rank'}] +
+                 [{'n': n, 'v': 'bg' + v} for v, n in self.WJ_BG] +
+                 [{'n': n, 'v': 'st' + v} for v, n in self.WJ_SET]},
+            ],
+            'hd': [
+                {'name': '分类', 'key': 'cat', 'value': [{'n': n, 'v': v} for v, n in self.HD_CATS]},
+            ],
+            'hj': [
+                {'name': '分类', 'key': 'cat', 'value': [{'n': n, 'v': v} for v, n in self.HJ_CATS]},
+            ],
+        }
+        return {'class': classes, 'filters': filters, 'list': []}
+
+    def homeVideoContent(self):
+        
+        return {'list': []}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        pg = self._pagebase(pg)
+        key = self._tostr(tid).split(':')[0]
+        ext = extend if isinstance(extend, dict) else {}
+        cat = ext.get('cat') or ''
+        try:
+            if key == 'hg':
+                return self._hg_category(cat or 'ai-duanju', ext.get('by') or 'hot', pg)
+            if key == 'yg':
+                return self._yg_category(cat, pg)
+            if key == 'jg':
+                return self._jg_category(cat or 'latest', pg)
+            if key == 'wj':
+                return self._wj_category(cat, pg)
+            if key == 'hd':
+                return self._hd_category(cat, pg)
+            if key == 'hj':
+                return self._hj_category(cat, pg)
+        except Exception as e:
+            self._log('categoryContent err: %s' % e)
+        return self._emptyCat(pg)
+
+    def detailContent(self, ids):
+        try:
+            vid = ids[0] if isinstance(ids, list) else ids
+        except Exception:
+            return self._emptyDetail()
+        vid = self._tostr(vid)
+        if vid.startswith('sgp6:'):
+            return {'list': []}
+        key, cid = self._src(vid)
+        try:
+            if key == 'hg':
+                return self._hg_detail(cid)
+            if key == 'yg':
+                return self._yg_detail(cid)
+            if key == 'jg':
+                return self._jg_detail(cid)
+            if key == 'wj':
+                return self._wj_detail(cid)
+            if key == 'hd':
+                return self._hd_detail(cid)
+            if key == 'hj':
+                return self._hj_detail(cid)
+        except Exception as e:
+            self._log('detailContent err: %s' % e)
+        return self._emptyDetail()
+
+    def searchContent(self, key, quick, pg='1'):
+        if quick:
+            return {'list': []}
+        kw = self._tostr(key)
+        if not kw:
+            return {'list': []}
+        pmap = self._prefixMap()
+        parts = kw.split(None, 1)
+        prefix = parts[0].strip()
+        word = parts[1].strip() if len(parts) > 1 else ''
+        skey = pmap.get(prefix)
+        if not skey or not word:
+            names = ' / '.join([n for _, n in self.SOURCES])
+            return {'list': [self._hint('搜索请加分类名前缀', '支持: ' + names)]}
+        if skey == 'hd':
+            return {'list': [self._hint('黄豆没有搜索接口', '请到分类页浏览')]}
+        fns = {'hg': self._hg_search, 'yg': self._yg_search, 'jg': self._jg_search,
+               'wj': self._wj_search, 'hj': self._hj_search}
+        fn = fns.get(skey)
+        if not fn:
+            return {'list': []}
+        try:
+            items = fn(word, self._pagebase(pg))
+        except Exception as e:
+            self._log('searchContent err: %s' % e)
+            items = []
+        if not items:
+            return {'list': [self._hint('搜索结果为空', '换个关键词试试')]}
+        return {'list': items}
+
+    def playerContent(self, flag, id, vipFlags):
+        sid = self._tostr(id)
+        key, cid = self._src(sid)
+        try:
+            if key == 'hg':
+                return self._hg_play(cid)
+            if key == 'yg':
+                return self._yg_play(cid)
+            if key == 'jg':
+                return self._jg_play(cid)
+            if key == 'wj':
+                return self._wj_play(cid)
+            if key == 'hd':
+                parts = cid.split(':', 1)
+                return self._hd_play(parts[0], parts[1] if len(parts) > 1 else '')
+            if key == 'hj':
+                return self._hj_play(cid)
+        except Exception as e:
+            self._log('playerContent err: %s' % e)
+        return {}
